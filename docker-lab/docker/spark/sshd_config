@@ -1,0 +1,9 @@
+Port 22
+ListenAddress 0.0.0.0
+PermitRootLogin no
+PasswordAuthentication yes
+KbdInteractiveAuthentication no
+UsePAM no
+AllowUsers spark
+PrintMotd no
+Subsystem sftp /usr/lib/openssh/sftp-server

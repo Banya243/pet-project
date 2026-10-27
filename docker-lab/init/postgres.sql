@@ -1,0 +1,2 @@
+CREATE USER lab WITH PASSWORD 'lab';
+CREATE DATABASE warehouse OWNER lab;

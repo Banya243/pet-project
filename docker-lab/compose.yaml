@@ -1,0 +1,243 @@
+name: jobs-lab
+
+x-airflow-env: &airflow-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+  AIRFLOW__CORE__PARALLELISM: "2"
+  AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "2"
+  AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+  AIRFLOW__WEBSERVER__WORKERS: "2"
+  AIRFLOW__WEBSERVER__SECRET_KEY: jobs-lab-local-webserver-key
+  AIRFLOW__CORE__FERNET_KEY: ""
+  AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+  AIRFLOW_CONN_MINIO_S3: '{"conn_type":"aws","login":"minioadmin","password":"minioadmin","extra":{"endpoint_url":"http://minio:9000","region_name":"us-east-1","config_kwargs":{"s3":{"addressing_style":"path"}}}}'
+  AIRFLOW_CONN_SPARK_SSH: '{"conn_type":"ssh","host":"spark-gateway","port":22,"login":"spark","password":"spark","extra":{"no_host_key_check":true,"look_for_keys":false}}'
+  AIRFLOW_CONN_WAREHOUSE: '{"conn_type":"postgres","host":"postgres","port":5432,"login":"lab","password":"lab","schema":"warehouse"}'
+
+x-airflow: &airflow
+  image: jobs-lab-airflow:2.11.2
+  pull_policy: never
+  environment: *airflow-env
+  volumes:
+    - ./dags:/opt/airflow/dags:ro
+    - airflow-logs:/opt/airflow/logs
+  restart: unless-stopped
+
+x-spark: &spark
+  image: jobs-lab-spark:3.5.8
+  pull_policy: never
+  environment:
+    SPARK_HOME: /opt/spark
+    PYSPARK_PYTHON: /usr/bin/python3
+    PYSPARK_DRIVER_PYTHON: /usr/bin/python3
+  volumes:
+    - ./config/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    - ./jobs:/opt/lab/jobs:ro
+  restart: unless-stopped
+
+x-flink: &flink
+  image: flink:1.18.1-scala_2.12-java11
+  environment: &flink-env
+    ENABLE_BUILT_IN_PLUGINS: flink-s3-fs-hadoop-1.18.1.jar
+    FLINK_PROPERTIES: |
+      jobmanager.rpc.address: flink-jobmanager
+      rest.address: flink-jobmanager
+      rest.bind-address: 0.0.0.0
+      taskmanager.numberOfTaskSlots: 2
+      parallelism.default: 2
+      jobmanager.memory.process.size: 1024m
+      taskmanager.memory.process.size: 1536m
+      execution.checkpointing.interval: 30s
+      state.checkpoints.dir: s3://processed/flink/checkpoints
+      state.savepoints.dir: s3://processed/flink/savepoints
+      s3.endpoint: http://minio:9000
+      s3.path.style.access: true
+      s3.access-key: minioadmin
+      s3.secret-key: minioadmin
+  volumes:
+    - ./jobs:/opt/lab/jobs:ro
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-15433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init/postgres.sql:/docker-entrypoint-initdb.d/01-lab.sql:ro
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  minio:
+    image: jobs-lab-minio:2025-04-22
+    build: ./docker/minio
+    command: [server, /data, --console-address, ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_BROWSER_REDIRECT_URL: http://localhost:${MINIO_CONSOLE_PORT:-19001}
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:-19000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-19001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://localhost:9000/minio/health/live]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  minio-init:
+    image: jobs-lab-airflow:2.11.2
+    pull_policy: never
+    entrypoint: [python, /init/minio.py]
+    volumes:
+      - ./init/minio.py:/init/minio.py:ro
+      - ./data/orders.csv:/seed/orders.csv:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+
+  spark-master:
+    <<: *spark
+    build: ./docker/spark
+    command: [master]
+    ports:
+      - "127.0.0.1:${SPARK_MASTER_PORT:-18081}:8080"
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://localhost:8080/]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  spark-worker:
+    <<: *spark
+    command: [worker]
+    ports:
+      - "127.0.0.1:${SPARK_WORKER_PORT:-18082}:8081"
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://localhost:8081/]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  spark-gateway:
+    <<: *spark
+    hostname: spark-gateway
+    command: [gateway]
+    ports:
+      - "127.0.0.1:${SPARK_SSH_PORT:-12222}:22"
+      - "127.0.0.1:${SPARK_DRIVER_PORT:-14040}:4040"
+    depends_on:
+      spark-worker:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD-SHELL, "bash -c 'exec 3<>/dev/tcp/127.0.0.1/22'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  airflow-init:
+    <<: *airflow
+    build: ./docker/airflow
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: airflow
+      _AIRFLOW_WWW_USER_PASSWORD: airflow
+    command: [version]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow
+    command: [webserver]
+    ports:
+      - "127.0.0.1:${AIRFLOW_PORT:-18080}:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://localhost:8080/health]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
+  airflow-scheduler:
+    <<: *airflow
+    command: [scheduler]
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      spark-gateway:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://localhost:8974/health]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
+  flink-jobmanager:
+    <<: *flink
+    command: jobmanager
+    ports:
+      - "127.0.0.1:${FLINK_PORT:-18083}:8081"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD-SHELL, "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8081'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  flink-taskmanager:
+    <<: *flink
+    command: taskmanager
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+
+  sbt:
+    image: jobs-lab-sbt:1.10.11
+    build: ./docker/sbt
+    profiles: [tools]
+    working_dir: /workspace/scala
+    volumes:
+      - ./jobs/scala:/workspace/scala
+      - sbt-cache:/root/.sbt
+      - ivy-cache:/root/.ivy2
+      - coursier-cache:/root/.cache/coursier
+
+volumes:
+  postgres-data:
+  minio-data:
+  airflow-logs:
+  sbt-cache:
+  ivy-cache:
+  coursier-cache:
