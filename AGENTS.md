@@ -1,6 +1,6 @@
 # Контекст проекта для следующих чатов
 
-Последнее обновление: **27 октября 2026 года**.
+Последнее обновление: **28 октября 2026 года**.
 
 ## Назначение и текущее состояние
 
@@ -11,7 +11,9 @@
 
 Docker-стенд уже создан, собран, запущен и проверен. Основная реализация
 находится в `docker-lab/`. В проекте есть проверки инфраструктуры и исходные
-данные; первая бизнес-джоба агрегации заказов пока не реализована.
+данные, а также реализован поток Kafka → S3 на Scala/Flink.
+Генератор синтетики пользователь реализует самостоятельно.
+Джоба дневной бизнес-агрегации заказов пока не реализована.
 
 Рабочая среда при настройке: Windows, PowerShell, Docker Desktop с Linux
 containers. Исходный путь репозитория: `C:\projects\pet projects`.
@@ -31,6 +33,12 @@ containers. Исходный путь репозитория: `C:\projects\pet p
 | sbt-assembly | `2.3.1`, `project/plugins.sbt` |
 | Spark / PySpark | `3.5.8`, выбранная конкретная версия Spark 3 |
 | Flink | `1.18.1`, образ `flink:1.18.1-scala_2.12-java11` |
+| Kafka (необязательный профиль) | `3.9.1`, образ `apache/kafka:3.9.1` |
+| Flink Kafka connector | `3.2.0-1.18` |
+| Flink Avro / Parquet | `1.18.1` |
+| Parquet Avro | `1.13.1` |
+| Hadoop client API / runtime для Parquet | `3.3.4` |
+| MUnit для тестов Kafka → S3 | `1.0.2` |
 | Java для движков и сборки | `11`; patch-версии зависят от базового образа |
 | Airflow | `2.11.2`, база `apache/airflow:2.11.2-python3.11` |
 | Python в Airflow | `3.11` |
@@ -66,7 +74,10 @@ constraints Airflow `2.11.2` для Python `3.11`, затем выполняет
 |   |-- .gitignore                  # .env, target/, Python-кеши и файлы IDE
 |   |-- .gitattributes              # LF для shell-скриптов, Dockerfile и .conf
 |   |-- config/
+|   |   |-- kafka/client.properties.example # Пример Kafka properties, локальные секреты игнорируются
 |   |   `-- spark-defaults.conf     # Spark-кластер, ресурсы и подключение S3A
+|   |-- docs/
+|   |   `-- kafka-to-s3.md          # Контракт потока, запуск и восстановление
 |   |-- dags/
 |   |   `-- environment_check.py    # Проверка связки Airflow/S3/SSH/Spark/JDBC
 |   |-- data/
@@ -90,14 +101,19 @@ constraints Airflow `2.11.2` для Python `3.11`, затем выполняет
 |   |   `-- postgres.sql            # Пользователь lab и база warehouse
 |   `-- jobs/
 |       |-- pyspark/
-|       |   `-- environment_check.py
+|       |   |-- environment_check.py
+|       |   `-- verify_kafka_raw.py  # Проверка записей, tombstone и Kafka-координат в S3
 |       `-- scala/
-|           |-- build.sbt           # Подпроекты sparkJob и flinkJob
+|           |-- build.sbt           # Подпроекты sparkJob, flinkJob и kafkaToS3
 |           |-- project/
 |           |   |-- build.properties
 |           |   `-- plugins.sbt
 |           |-- spark/src/main/scala/lab/spark/EnvironmentCheck.scala
-|           `-- flink/src/main/scala/lab/flink/EnvironmentCheck.scala
+|           |-- flink/src/main/scala/lab/flink/EnvironmentCheck.scala
+|           `-- kafka-to-s3/
+|               |-- src/main/resources/kafka-envelope-v1.avsc
+|               |-- src/main/scala/lab/kafka/ # KafkaToS3, JobConfig, KafkaEnvelope
+|               `-- src/test/scala/lab/kafka/KafkaToS3Suite.scala
 `-- .idea/                          # Локальные настройки IDE, игнорируются Git
 ```
 
@@ -122,6 +138,8 @@ constraints Airflow `2.11.2` для Python `3.11`, затем выполняет
 | `airflow-scheduler` | Планировщик и выполнение задач через `LocalExecutor` |
 | `flink-jobmanager` | Flink JobManager и REST/UI |
 | `flink-taskmanager` | Один TaskManager с двумя slots |
+| `kafka` | Один KRaft broker/controller; необязательный профиль `kafka` |
+| `kafka-init` | Назначение владельца Kafka volume; одноразовый сервис профиля `kafka` |
 | `sbt` | Одноразовый контейнер сборки, профиль `tools` |
 
 Airflow использует `LocalExecutor`, `parallelism=2`, максимум две активные задачи
@@ -132,6 +150,9 @@ Airflow подключает `dags/` в `/opt/airflow/dags` только для 
 Spark и Flink подключают `jobs/` в `/opt/lab/jobs` только для чтения.
 Контейнер sbt подключает `jobs/scala/` с правом записи в `/workspace/scala`.
 После правки Python-файла он сразу виден в контейнере; Scala-код нужно пересобрать.
+Оба Flink-контейнера также подключают `config/kafka/` в
+`/opt/lab/config/kafka` только для чтения. Этот каталог предназначен для
+дополнительных Kafka properties и TLS/SASL-файлов; локальные секреты игнорируются Git.
 
 Spark запускает driver в `spark-gateway`: master
 `spark://spark-master:7077`, deploy mode `client`, driver host `spark-gateway`.
@@ -143,8 +164,15 @@ Flink использует Java 11, parallelism `2`, JobManager `1024m`, TaskMan
 Включён встроенный плагин `flink-s3-fs-hadoop-1.18.1.jar`.
 Интервал checkpoints настроен на `30s`; пути:
 `s3://processed/flink/checkpoints` и `s3://processed/flink/savepoints`.
-Проверен запуск конечной Flink-джобы; восстановление длительного потока
-из checkpoint пока отдельно не проверялось.
+Проверены запуск конечной Flink-джобы, а 28.10.2026 — восстановление Kafka → S3
+из checkpoint после перезапуска TaskManager и запуск из stop-savepoint.
+Отказоустойчивого HA JobManager в этом standalone стенде нет.
+
+Kafka включается профилем `kafka`, использует KRaft и отдельный volume
+`kafka-data`. Брокер работает как `appuser` (`1000:1000`); перед ним одноразовый
+`kafka-init` назначает владельца корня volume. Автосоздание топиков отключено,
+retention по умолчанию — семь суток. Для Kafka нужен дополнительный запас
+около 1 GB RAM. Это локальный одноброкерный стенд без репликации данных.
 
 ## Адреса и учебные учётные данные
 
@@ -157,6 +185,7 @@ Flink использует Java 11, parallelism `2`, JobManager `1024m`, TaskMan
 | Spark master UI | http://localhost:18081 | — |
 | Spark worker UI | http://localhost:18082 | — |
 | Flink UI | http://localhost:18083 | — |
+| Kafka (профиль `kafka`) | `localhost:19092` | — |
 | MinIO Console | http://localhost:19001 | `minioadmin` / `minioadmin` |
 | S3 API | http://localhost:19000 | access key / secret key: `minioadmin` / `minioadmin` |
 | Учебный PostgreSQL | `localhost:15433`, БД `warehouse` | `lab` / `lab` |
@@ -176,6 +205,12 @@ Flink использует Java 11, parallelism `2`, JobManager `1024m`, TaskMan
 | Учебный JDBC | `jdbc:postgresql://postgres:5432/warehouse` |
 | Метаданные Airflow | `postgresql+psycopg2://airflow:airflow@postgres:5432/airflow` |
 | Flink REST | `http://flink-jobmanager:8081` |
+| Kafka | `kafka:9092` |
+
+Внешний Kafka-порт настраивается через `KAFKA_PORT` в `.env`.
+Producer на Windows использует `localhost:19092`, а Flink — `kafka:9092`.
+Для внешнего брокера нужны доступные контейнерам bootstrap и advertised listeners;
+`localhost` внутри контейнера указывает на сам контейнер.
 
 В Airflow через `AIRFLOW_CONN_*` заданы connections:
 
@@ -212,6 +247,10 @@ Flink использует Java 11, parallelism `2`, JobManager `1024m`, TaskMan
   и печатает версии Scala и Spark.
 - Scala `lab.flink.EnvironmentCheck`: через Java DataStream API преобразует
   `1, 2, 3` в `10, 20, 30` и выводит результат в логи TaskManager.
+- Scala/Flink `lab.kafka.KafkaToS3`: переносит сырой поток Kafka в Parquet/Snappy
+  в MinIO; подробности и результаты проверок приведены в отдельном разделе ниже.
+- PySpark `jobs/pyspark/verify_kafka_raw.py`: читает небольшой проверочный S3-префикс,
+  проверяет число записей и tombstone, уникальность `(topic, partition, offset)`.
 
 ## Команды эксплуатации и разработки
 
@@ -233,22 +272,26 @@ docker compose ps -a
 Они должны завершаться, а не работать постоянно.
 Для первого запуска нужен доступ к реестрам Docker, GitHub и Maven/PyPI/Go-зависимостям.
 Ориентир для Docker: около 10 GB RAM и 15–20 GB диска под образы и кеши.
+Профиль Kafka добавляет около 1 GB RAM; `kafka-init` должен завершиться с кодом `0`.
 
 Сборка Scala-JAR:
 
 ```powershell
-docker compose run --rm --build -T sbt "sparkJob/assembly" "flinkJob/assembly"
+docker compose run --rm --build -T sbt "sparkJob/assembly" "flinkJob/assembly" "kafkaToS3/assembly"
 ```
 
 Артефакты:
 
 - `jobs/scala/spark/target/scala-2.12/spark-job.jar`.
 - `jobs/scala/flink/target/scala-2.12/flink-job.jar`.
+- `jobs/scala/kafka-to-s3/target/scala-2.12/kafka-to-s3.jar`.
 
 Spark и Flink — `Provided`-зависимости. Spark-JAR не включает Scala library,
 поскольку её предоставляет Spark; Flink-пример использует Java API из Scala
 и собирается со стандартными настройками включения Scala в assembly.
 sbt-контейнер ограничен двумя активными CPU и Java heap `1536m`.
+`kafkaToS3` получает Flink, FileSink и Scala library от кластера, а Kafka/Avro/Parquet
+и нужные Hadoop API входят в его JAR. S3 работает через существующий filesystem plugin.
 
 Запуск Scala-джоб:
 
@@ -282,14 +325,23 @@ docker compose up -d --wait --wait-timeout 300
 `docker compose down` удаляет контейнеры и сеть, сохраняя volumes.
 `docker compose down --volumes` полностью удаляет данные и кеши этого стенда;
 это команда полного сброса, а не обычной остановки.
+Для включения Kafka после остановки используй
+`docker compose --profile kafka up -d --wait --wait-timeout 180 kafka`.
+Для остановки всего стенда вместе с Kafka используй `docker compose --profile kafka stop`,
+для удаления его контейнеров — `docker compose --profile kafka down`.
+Добавление `--volumes` к последней команде удаляет также сохранённые сообщения Kafka.
+Перед плановой остановкой работающей Kafka → S3 джобы создай stop-savepoint;
+повторный запуск контейнеров сам по себе не отправляет остановленную джобу в Flink.
 
 ## Хранение данных
 
 Compose объявляет volumes `postgres-data`, `minio-data`, `airflow-logs`,
-`sbt-cache`, `ivy-cache`, `coursier-cache`. Их полные Docker-имена имеют
-префикс `jobs-lab_`.
+`sbt-cache`, `ivy-cache`, `coursier-cache`, а для профиля Kafka — `kafka-data`.
+Полные Docker-имена volumes имеют префикс `jobs-lab_`.
 
-В них сохраняются базы, S3-объекты, логи Airflow и кеши сборки.
+В них сохраняются базы, S3-объекты, логи Airflow, кеши сборки и Kafka log.
+Parquet, checkpoints и savepoints находятся в MinIO volume `jobs-lab_minio-data`;
+сообщения брокера — в `jobs-lab_kafka-data`.
 Исходники и сгенерированные Scala-JAR находятся в подключённых каталогах проекта.
 Не добавляй `target/`, `.env` и кеши в Git.
 
@@ -298,8 +350,8 @@ Compose объявляет volumes `postgres-data`, `minio-data`, `airflow-logs`
 1. На компьютере уже работали другие Docker-проекты: Airflow, Jupyter,
    PostgreSQL, Kafka Connect и другие сервисы. Обычные порты пересекались
    с ними; для этого стенда выбраны отдельные внешние порты `18080–18083`,
-   `19000–19001`, `15433`, `12222`, `14040`. Используй Compose-файл этого
-   проекта и не останавливай посторонние контейнеры.
+   `19000–19001`, `15433`, `12222`, `14040`, а для Kafka — `19092`.
+   Используй Compose-файл этого проекта и не останавливай посторонние контейнеры.
 2. Исторические готовые образы MinIO во время настройки были недоступны
    в Docker Hub и Quay. Рабочее решение — `docker/minio/Dockerfile`,
    который собирает официальный source tag через Go `1.24.2` и копирует
@@ -368,3 +420,83 @@ Compose объявляет volumes `postgres-data`, `minio-data`, `airflow-logs`
 Подробная эксплуатационная инструкция: [docker-lab/README.md](docker-lab/README.md).
 При изменениях окружения актуализируй этот файл и README; исторические результаты
 проверок обновляй только после фактического выполнения соответствующих команд.
+
+## Джоба Kafka → S3: реализована 28.10.2026
+
+Новая джоба `lab.kafka.KafkaToS3` находится в отдельном подпроекте
+`docker-lab/jobs/scala/kafka-to-s3/`. Это Scala/Flink Java DataStream API:
+`KafkaSource` → `FileSink` → Parquet/Snappy в MinIO. Генератор синтетики
+пользователь реализует самостоятельно, его добавлять без нового задания не нужно.
+
+Джоба сохраняет сырой payload и key как nullable binary, headers с повторами,
+topic, partition, offset, исходный Kafka timestamp/type, время приёма и версию
+envelope. Бизнес-схема не навязывается: JSON, бинарные сообщения, пустые значения
+и tombstone сохраняются без пропуска; DLQ и бизнес-валидация относятся к следующему слою.
+Схема: `src/main/resources/kafka-envelope-v1.avsc` внутри нового подпроекта.
+Каталоги S3: `topic=<topic>/ingest_date=yyyy-MM-dd/ingest_hour=HH` в UTC.
+
+Flink runtime остаётся `1.18.1`, Kafka connector — `3.2.0-1.18`,
+Parquet Avro — `1.13.1`, Hadoop client API/runtime — `3.3.4`.
+Движок, FileSink и Scala library предоставляются Flink; Kafka/Parquet/Avro
+и нужные Parquet Hadoop API включаются в отдельный JAR.
+
+```powershell
+docker compose run --rm -T sbt "kafkaToS3/test" "kafkaToS3/assembly"
+```
+
+Артефакт: `docker-lab/jobs/scala/kafka-to-s3/target/scala-2.12/kafka-to-s3.jar`.
+Полная инструкция: [docker-lab/docs/kafka-to-s3.md](docker-lab/docs/kafka-to-s3.md).
+
+В Compose добавлен необязательный профиль `kafka`: официальный
+`apache/kafka:3.9.1`, один KRaft broker/controller, volume `jobs-lab_kafka-data`.
+Одноразовый `kafka-init` назначает владельца корня volume (`1000:1000`) и
+завершается с кодом `0`; сам брокер работает как `appuser`. Внешний адрес
+`localhost:19092`, настраивается `KAFKA_PORT` в `.env`; внутри сети — `kafka:9092`.
+Автосоздание топиков отключено. Топик `orders.events` создан пустым с двумя partitions.
+Обычный `docker compose up` не включает Kafka без профиля.
+
+```powershell
+docker compose --profile kafka up -d --wait --wait-timeout 180 kafka
+```
+
+Каталог `docker-lab/config/kafka/` подключён в оба Flink-контейнера как
+`/opt/lab/config/kafka:ro`. Есть пример дополнительных Kafka properties;
+секреты, truststores и ключи игнорируются Git. Auto-commit отключён,
+`isolation.level=read_committed`, group offsets отправляются на checkpoint.
+
+Обязательны `--bootstrap-servers`, `--topics`, `--group-id`, `--output`,
+`--checkpoint-dir`. По умолчанию используются earliest, parallelism=2,
+checkpoint каждые 30 секунд, timeout=120 секунд, порог файла 128 МиБ,
+row group 32 МиБ. Parquet закрывается также на каждом checkpoint;
+при небольшом потоке получаются маленькие файлы. Есть конечный режим `--bounded true`.
+
+Стабильные UID source/sink и checkpoints обеспечивают согласованное восстановление
+offsets и FileSink. При потере offsets из-за retention автоматический reset запрещён.
+Exactly-once требует восстановления актуального согласованного состояния;
+обычный новый `flink run` не подхватывает checkpoint по одному только каталогу.
+Для плановой остановки используется `flink stop --savepointPath ... JOB_ID`,
+для восстановления — `flink run -s ...` с прежними аргументами.
+В standalone стенде нет HA JobManager: после его потери восстановление ручное.
+Не запускай две копии на один output; replay выполняй в новый префикс.
+
+Фактически проверено 28.10.2026:
+
+- Обычная конфигурация Compose и профиль Kafka валидны; брокер healthy,
+  init завершился с кодом `0`, внешний Kafka listener работает.
+- Все 8 тестов `kafkaToS3/test` и assembly завершились успешно; проверены
+  binary payload, null/empty, headers, Avro serialization, UTC и Snappy Parquet.
+- Поток прочитан из Kafka и сохранён в MinIO. После перезапуска TaskManager
+  Flink автоматически восстановился из checkpoint в S3.
+- `flink stop` создал savepoint; новая джоба восстановилась из него и прочитала
+  запись, отправленную во время остановки, даже с `--starting-offsets latest`.
+- Независимая проверка Spark получила `records=6`, `unique_offsets=6`,
+  `tombstones=1`. Конечный snapshot успешно завершился и дал такие же показатели.
+
+Read-only проверка: `docker-lab/jobs/pyspark/verify_kafka_raw.py` с параметрами
+`--input`, `--expected-records`, `--expected-tombstones`. Проверочные артефакты
+остались в изолированных префиксах `raw/kafka/k2s-verification-mvsixuz2`
+и `raw/kafka/k2s-verification-mvsixuz2-snapshot`, а также под соответствующими
+checkpoints/savepoints в `processed`; проверочный Kafka-топик имеет такое же имя.
+По завершении проверок 28.10.2026 все проверочные Flink-задачи были завершены;
+пользовательский поток автоматически не запускался. Текущее состояние проверяй
+через `docker compose ps -a` и Flink UI. Результаты 27.10.2026 выше остаются историческими.
