@@ -10,3 +10,4 @@ config/kafka/*.jks
 config/kafka/*.p12
 config/kafka/*.pem
 config/kafka/*.key
+config/*
