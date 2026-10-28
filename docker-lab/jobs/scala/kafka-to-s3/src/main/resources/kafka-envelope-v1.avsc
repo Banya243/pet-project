@@ -1,0 +1,24 @@
+{
+  "type": "record",
+  "name": "KafkaEnvelopeV1",
+  "namespace": "lab.kafka.avro",
+  "fields": [
+    {"name": "schema_version", "type": "int"},
+    {"name": "topic", "type": "string"},
+    {"name": "partition", "type": "int"},
+    {"name": "offset", "type": "long"},
+    {"name": "kafka_timestamp_ms", "type": "long"},
+    {"name": "timestamp_type", "type": "string"},
+    {"name": "ingested_at_ms", "type": "long"},
+    {"name": "key", "type": ["null", "bytes"], "default": null},
+    {"name": "value", "type": ["null", "bytes"], "default": null},
+    {"name": "headers", "type": {"type": "array", "items": {
+      "type": "record",
+      "name": "KafkaHeader",
+      "fields": [
+        {"name": "key", "type": "string"},
+        {"name": "value", "type": ["null", "bytes"], "default": null}
+      ]
+    }}}
+  ]
+}
